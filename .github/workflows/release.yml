@@ -16,24 +16,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: 20
+          bun-version: latest
 
       - name: Check tag matches manifest.json / package.json version
         run: |
           TAG="${GITHUB_REF_NAME#v}"
-          MANIFEST="$(node -p "require('./manifest.json').version")"
-          PKG="$(node -p "require('./package.json').version")"
+          MANIFEST="$(bun -e "console.log(require('./manifest.json').version)")"
+          PKG="$(bun -e "console.log(require('./package.json').version)")"
           echo "tag=$TAG manifest=$MANIFEST package=$PKG"
           if [ "$TAG" != "$MANIFEST" ] || [ "$TAG" != "$PKG" ]; then
             echo "::error::Tag ($TAG) must equal the version in manifest.json ($MANIFEST) and package.json ($PKG)."
             exit 1
           fi
 
-      - run: npm install
-      - run: npm test
-      - run: npm run build
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run build
 
       - name: Publish release
         env:

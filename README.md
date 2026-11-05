@@ -5,10 +5,10 @@
 ## 安装
 
 ```bash
-npm install && npm run build   # 生成 main.js
+bun install && bun run build   # 生成 main.js（需要 Bun）
 ```
 
-把 `main.js`、`manifest.json` 复制到 `<vault>/.obsidian/plugins/webdav-e2ee-sync/`，然后在 Obsidian 里启用。
+把 `main.js`、`manifest.json`、`styles.css` 复制到 `<vault>/.obsidian/plugins/webdav-e2ee-sync/`，然后在 Obsidian 里启用。
 
 ## 设计
 
@@ -49,6 +49,6 @@ npm install && npm run build   # 生成 main.js
 
 ## 开发
 ```bash
-npm test          # vitest：分块、加密、同步引擎（内存 WebDAV 服务器）
-npm run dev       # esbuild watch
+bun test          # 分块、加密、同步引擎（内存 WebDAV 服务器）
+bun run dev       # esbuild watch
 ```

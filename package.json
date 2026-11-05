@@ -5,10 +5,10 @@
   "description": "Obsidian plugin: WebDAV sync with end-to-end encryption and content-defined-chunking delta sync",
   "main": "main.js",
   "scripts": {
-    "dev": "node esbuild.config.mjs",
-    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "dev": "bun esbuild.config.mjs",
+    "build": "tsc --noEmit && bun esbuild.config.mjs production",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
