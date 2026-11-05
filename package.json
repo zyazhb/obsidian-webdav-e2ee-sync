@@ -1,0 +1,21 @@
+{
+  "name": "obsidian-webdav-e2ee-sync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Obsidian plugin: WebDAV sync with end-to-end encryption and content-defined-chunking delta sync",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.21.5",
+    "obsidian": "latest",
+    "tslib": "^2.6.2",
+    "typescript": "~5.4.5",
+    "vitest": "^1.6.0"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "id": "webdav-e2ee-sync",
+  "name": "WebDAV E2EE Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Sync your vault over WebDAV with end-to-end encryption and chunk-level delta sync.",
+  "author": "zya",
+  "isDesktopOnly": false
+}

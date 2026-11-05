@@ -1,0 +1,22 @@
+.wds-view { padding: 8px 12px; }
+.wds-head { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.wds-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.wds-phase { font-weight: 600; }
+.wds-head progress { width: 100%; }
+.wds-sub, .wds-counts, .wds-empty { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.wds-toolbar { display: flex; gap: 6px; margin-bottom: 8px; }
+.wds-toolbar input { flex: 1; min-width: 0; }
+.wds-counts { margin-bottom: 6px; }
+.wds-row { display: flex; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--background-modifier-border); }
+.wds-icon { width: 1.2em; text-align: center; flex: none; }
+.wds-body { min-width: 0; }
+.wds-path { cursor: pointer; overflow-wrap: anywhere; }
+.wds-path:hover { text-decoration: underline; }
+.wds-label { color: var(--text-muted); font-size: var(--font-ui-smaller); overflow-wrap: anywhere; }
+.wds-active .wds-icon { color: var(--interactive-accent); animation: wds-spin 1.2s linear infinite; display: inline-block; }
+.wds-error .wds-icon, .wds-error .wds-label { color: var(--text-error); }
+.wds-done .wds-icon, .wds-synced .wds-icon { color: var(--text-success); }
+.wds-unsynced .wds-icon { color: var(--text-warning); }
+.wds-ignored { opacity: 0.5; }
+@keyframes wds-spin { to { transform: rotate(360deg); } }
+.wds-statusbar { cursor: pointer; }
