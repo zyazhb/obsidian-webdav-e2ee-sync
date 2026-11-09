@@ -1,6 +1,6 @@
 {
   "name": "obsidian-webdav-e2ee-sync",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Obsidian plugin: WebDAV sync with end-to-end encryption (rclone crypt compatible)",
   "main": "main.js",
