@@ -1,20 +1,21 @@
-import { chunkRanges, ChunkOptions, DEFAULT_CHUNK } from "./chunker";
-import { Cipher, newMeta, plainCipher, RemoteMeta, unlock } from "./crypto";
-import { compileIgnore, concat, gunzip, gzip, hasGzip, pool, sha256Hex, td, te } from "./util";
-import { PreconditionFailed, WebDAV } from "./webdav";
+import { FileCipher, MAX_SEGMENT, makeRcloneCipher, plainFileCipher } from "./cipher";
+import { compileIgnore, pool, sha256Hex, te } from "./util";
+import { DavEntry, PreconditionFailed, WebDAV } from "./webdav";
 
 /*
- * Remote layout (all under the configured folder):
- *   meta.json            plaintext: E2EE flag, KDF salt, password-check blob
- *   index.bin            gzip(JSON) -> AES-GCM : path -> {hash,size,mtime,chunks[],tombstone}
- *   chunks/ab/<id>       AES-GCM(chunk), id = HMAC-SHA256(key, chunk)   (content-addressed)
+ * One vault file = one file on the server, stored in rclone-crypt format (see cipher.ts).
+ * There is no index and no custom protocol: the server's own listing (name, size, ETag) is
+ * the source of truth for "what changed remotely".
  *
- * File names, directory structure and sizes live only inside the encrypted index.
- * Delta sync = FastCDC chunks; only chunks whose id is not already referenced by
- * the index are uploaded, and on download only chunks missing locally are fetched.
+ * Change detection is a 3-way compare per path:
+ *   local  : sha256 of the file now            (re-hashed only when size/mtime changed)
+ *   remote : the server's signature (ETag, else size|mtime) now
+ *   base   : what both sides agreed on at the last successful sync (kept per device)
  *
- * Change detection is 3-way: local state vs. remote index vs. the "base" (what both
- * sides agreed on at the last successful sync).
+ * A path is "changed locally" if its hash differs from base, "changed remotely" if its signature
+ * differs from base. Deletions are detected the same way (missing now, present in base).
+ * When both sides changed, or a never-synced path exists on both sides, content is compared
+ * (downloaded and hashed if the sizes match) so identical files are simply adopted.
  */
 
 export interface FileInfo {
@@ -32,26 +33,14 @@ export interface VaultIO {
 }
 
 export interface BaseEntry {
-  h: string;
-  s: number;
-  m: number;
+  h: string; // sha256 of the plaintext at last sync
+  s: number; // local size at last sync
+  m: number; // local mtime at last sync
+  r: string; // remote signature at last sync
 }
 export interface LocalState {
   remoteId: string;
   files: Record<string, BaseEntry>;
-}
-export interface RemoteEntry {
-  h: string; // sha256 of whole file
-  s: number;
-  m: number; // mtime of the writer
-  c: string[]; // chunk ids
-  d?: boolean; // tombstone
-  r: number; // time of this change
-}
-export interface RemoteIndex {
-  v: 1;
-  rev: number;
-  files: Record<string, RemoteEntry>;
 }
 
 export interface SyncStats {
@@ -60,8 +49,6 @@ export interface SyncStats {
   deletedLocal: number;
   deletedRemote: number;
   conflicts: number;
-  chunksUp: number;
-  chunksDown: number;
   bytesUp: number;
   bytesDown: number;
   /** files whose transfer failed (they are retried on the next sync) */
@@ -77,20 +64,42 @@ export interface FileEvent {
   detail?: string;
 }
 
+export interface PlanItem {
+  path: string;
+  action: FileAction;
+  size?: number;
+  detail?: string;
+}
+export interface DryRunResult {
+  items: PlanItem[];
+  /** files already identical on both sides (nothing to transfer) */
+  identical: number;
+  totalLocal: number;
+  /** the server folder is empty although this device has sync history: everything would be re-uploaded */
+  remoteWillBeReset: boolean;
+  /** a real sync would refuse to run: it would delete a large share of the files at once */
+  massDelete: boolean;
+  /** files whose encrypted name would exceed the server's path-segment limit */
+  tooLong: string[];
+}
+
 export interface EngineOptions {
   io: VaultIO;
   dav: WebDAV;
   state: LocalState;
   saveState: () => Promise<void>;
-  /** null => no end-to-end encryption */
+  /** null => no end-to-end encryption (files stored as they are) */
   password: string | null;
+  /** rclone crypt "password2"; empty = rclone's built-in default salt */
+  salt?: string;
   ignore?: string[];
   includeConfig?: boolean;
   configDir: string;
   pluginDir: string;
   deviceName: string;
-  chunk?: ChunkOptions;
   concurrency?: number;
+  /** allow a sync that deletes many files at once (default: refuse, see dry run) */
+  allowMassDelete?: boolean;
   log?: (msg: string) => void;
   /** per-file progress */
   onEvent?: (e: FileEvent) => void;
@@ -98,32 +107,52 @@ export interface EngineOptions {
   onPhase?: (text: string) => void;
 }
 
-const TOMBSTONE_TTL = 90 * 24 * 3600 * 1000;
-const chunkPath = (id: string) => `chunks/${id.slice(0, 2)}/${id}`;
+interface RemoteFile {
+  path: string; // vault path
+  enc: string; // server path
+  size: number; // plaintext size, -1 if the stored size is not valid ciphertext
+  sig: string;
+  etag?: string;
+  modified?: number;
+}
+
+const RCLONE_MAGIC = [0x52, 0x43, 0x4c, 0x4f, 0x4e, 0x45, 0x00, 0x00]; // "RCLONE\0\0"
+const MASS_DELETE_MIN = 20;
+const MASS_DELETE_SHARE = 0.3;
+
+export const sigOf = (e: Pick<DavEntry, "etag" | "size" | "modified">): string =>
+  e.etag ?? `${e.size ?? "?"}|${e.modified ?? "?"}`;
+const strongEtag = (etag?: string) => (etag && !etag.startsWith("W/") ? etag : undefined);
+
 const emptyStats = (): SyncStats => ({
   uploaded: 0,
   downloaded: 0,
   deletedLocal: 0,
   deletedRemote: 0,
   conflicts: 0,
-  chunksUp: 0,
-  chunksDown: 0,
   bytesUp: 0,
   bytesDown: 0,
   errors: [],
 });
 
-type PassResult = "done" | "again" | "retry";
-
 export class SyncEngine {
-  private cipher: Cipher = plainCipher;
-  private unlocked = false;
+  private cipher: FileCipher = plainFileCipher;
+  private ready = false;
   private ignoreRes: RegExp[];
-  private chunkOpts: ChunkOptions;
   private conc: number;
   private stats = emptyStats();
   private errors = new Map<string, string>();
+  /** plaintext hash of remote files already downloaded for comparison, keyed by path+signature */
+  private hashCache = new Map<string, string>();
 
+  constructor(private o: EngineOptions) {
+    this.ignoreRes = compileIgnore(o.ignore ?? []);
+    this.conc = o.concurrency ?? 4;
+  }
+
+  private log(m: string) {
+    this.o.log?.(m);
+  }
   private emit(path: string, action: FileAction, status: FileStatus, detail?: string) {
     this.o.onEvent?.({ path, action, status, detail });
   }
@@ -146,79 +175,10 @@ export class SyncEngine {
     }
   }
 
-  constructor(private o: EngineOptions) {
-    this.ignoreRes = compileIgnore(o.ignore ?? []);
-    this.chunkOpts = o.chunk ?? DEFAULT_CHUNK;
-    this.conc = o.concurrency ?? 4;
-  }
-
-  private log(m: string) {
-    this.o.log?.(m);
-  }
-
-  // ───────────────────────── remote bootstrap ─────────────────────────
-
-  private async unlockRemote(depth = 0): Promise<void> {
-    if (this.unlocked) return;
-    const got = await this.o.dav.get("meta.json");
-    if (!got) {
-      await this.o.dav.ensureDir("");
-      const created = await newMeta(this.o.password);
-      try {
-        await this.o.dav.put("meta.json", te.encode(JSON.stringify(created.meta)), { ifNoneMatch: true });
-      } catch (e) {
-        // another device initialised the folder first -> adopt its meta
-        if (e instanceof PreconditionFailed && depth < 2) return this.unlockRemote(depth + 1);
-        throw e;
-      }
-      this.cipher = created.cipher;
-      this.unlocked = true;
-      return;
-    }
-    const meta = JSON.parse(td.decode(got.data)) as RemoteMeta;
-    if (meta.encrypted && this.o.password === null)
-      throw new Error("The remote folder is end-to-end encrypted: enable E2EE and enter the password.");
-    if (!meta.encrypted && this.o.password !== null)
-      throw new Error("The remote folder is NOT encrypted but E2EE is enabled locally. Use a new/empty remote folder or disable E2EE.");
-    this.cipher = meta.encrypted ? await unlock(meta, this.o.password as string) : plainCipher;
-    this.unlocked = true;
-  }
-
-  private ifMatchBroken = false;
-
-  private async loadIndex(): Promise<{ index: RemoteIndex; etag?: string; blob: Uint8Array } | null> {
-    // ETag first, data second: if the index changes in between we hold an older ETag than the
-    // data, so our conditional PUT fails safely (and we retry) instead of overwriting.
-    const etag = await this.o.dav.etag("index.bin");
-    if (etag === null) return null;
-    const got = await this.o.dav.get("index.bin");
-    if (!got) return null;
-    const raw = await this.cipher.decrypt(got.data, "index");
-    const json = raw[0] === 1 ? await gunzip(raw.subarray(1)) : raw.subarray(1);
-    return { index: JSON.parse(td.decode(json)) as RemoteIndex, etag: etag ?? got.etag, blob: got.data };
-  }
-
-  private async saveIndex(index: RemoteIndex, loaded: { etag?: string; blob: Uint8Array } | null): Promise<void> {
-    const json = te.encode(JSON.stringify(index));
-    const body = hasGzip ? concat([Uint8Array.of(1), await gzip(json)]) : concat([Uint8Array.of(0), json]);
-    const blob = await this.cipher.encrypt(body, "index");
-    // Optimistic concurrency: never overwrite an index that changed since we read it.
-    const etag = loaded?.etag;
-    if (!loaded) return void (await this.o.dav.put("index.bin", blob, { ifNoneMatch: true }));
-    if (!etag || etag.startsWith("W/") || this.ifMatchBroken) return void (await this.o.dav.put("index.bin", blob));
-    try {
-      await this.o.dav.put("index.bin", blob, { ifMatch: etag });
-    } catch (e) {
-      if (!(e instanceof PreconditionFailed)) throw e;
-      // Distinguish a real concurrent change from a server whose ETags don't round-trip:
-      // if the stored index is byte-identical to what we read, nobody else wrote.
-      const cur = await this.o.dav.get("index.bin");
-      if (cur && cur.data.length === loaded.blob.length && cur.data.every((v, i) => v === loaded.blob[i])) {
-        this.log("server rejected If-Match although the index is unchanged; disabling If-Match");
-        this.ifMatchBroken = true;
-        await this.o.dav.put("index.bin", blob);
-      } else throw e;
-    }
+  private async init() {
+    if (this.ready) return;
+    this.cipher = this.o.password === null ? plainFileCipher : await makeRcloneCipher(this.o.password, this.o.salt ?? "");
+    this.ready = true;
   }
 
   // ───────────────────────── exclusion rules ─────────────────────────
@@ -237,101 +197,96 @@ export class SyncEngine {
     return this.ignoreRes.some((re) => re.test(path));
   }
 
-  // ───────────────────────── chunk transfer ─────────────────────────
+  // ───────────────────────── remote access ─────────────────────────
 
-  private uploading = new Map<string, Promise<void>>();
-  private known = new Set<string>(); // chunk ids known to exist remotely
-
-  private uploadChunk(id: string, part: Uint8Array): Promise<void> {
-    if (this.known.has(id)) return Promise.resolve();
-    let p = this.uploading.get(id);
-    if (!p) {
-      p = (async () => {
-        const blob = await this.cipher.encrypt(part, id);
-        await this.o.dav.put(chunkPath(id), blob);
-        this.stats.chunksUp++;
-        this.stats.bytesUp += blob.length;
-        this.known.add(id);
-      })().finally(() => this.uploading.delete(id));
-      this.uploading.set(id, p);
+  /** Walks the server folder. Entries that do not decrypt with our key (foreign/legacy files) are ignored. */
+  private async listRemote(): Promise<Map<string, RemoteFile>> {
+    const out = new Map<string, RemoteFile>();
+    const root = await this.o.dav.list("");
+    if (!root) return out; // folder does not exist yet
+    let rootOk = 0;
+    const handle = async (dir: string, e: DavEntry, isRoot: boolean, next: string[]) => {
+      const enc = dir ? `${dir}/${e.name}` : e.name;
+      let plain: string;
+      try {
+        plain = await this.cipher.decName(enc);
+      } catch {
+        return;
+      }
+      if (isRoot) rootOk++;
+      if (e.isDir) return void next.push(enc);
+      if (this.isExcluded(plain)) return;
+      let size = -1;
+      try {
+        size = this.cipher.plainSize(e.size ?? 0);
+      } catch {
+        /* keep -1 */
+      }
+      out.set(plain, { path: plain, enc, size, sig: sigOf(e), etag: strongEtag(e.etag), modified: e.modified });
+    };
+    let dirs: string[] = [];
+    for (const e of root) await handle("", e, true, dirs);
+    if (this.cipher.encrypted && root.length > 0 && rootOk === 0)
+      throw new Error(
+        "Nothing in the remote folder can be decrypted: wrong encryption password/salt, or it is not an rclone-crypt folder " +
+          "(an older version of this plugin used a different format — use a new, empty remote folder)."
+      );
+    while (dirs.length) {
+      const next: string[] = [];
+      await pool(dirs, this.conc, async (d) => {
+        for (const e of (await this.o.dav.list(d)) ?? []) await handle(d, e, false, next);
+      });
+      dirs = next;
     }
-    return p;
+    return out;
   }
 
-  private async fetchChunk(id: string): Promise<Uint8Array> {
-    const got = await this.o.dav.get(chunkPath(id));
-    if (!got) throw new Error(`Remote chunk ${id.slice(0, 8)}… is missing`);
-    const data = await this.cipher.decrypt(got.data, id);
-    if ((await this.cipher.chunkId(data)) !== id) throw new Error("Chunk integrity check failed");
-    this.stats.chunksDown++;
+  private async download(rf: RemoteFile): Promise<Uint8Array> {
+    const got = await this.o.dav.get(rf.enc);
+    if (!got) throw new Error("The file disappeared from the server");
     this.stats.bytesDown += got.data.length;
-    return data;
+    if (!this.cipher.encrypted && RCLONE_MAGIC.every((b, i) => got.data[i] === b))
+      throw new Error("This file is encrypted (rclone crypt): enable E2EE and enter the password.");
+    return this.cipher.decData(got.data);
   }
 
-  /** Rebuild a remote file, fetching only chunks that are not in `reuse`. */
-  private async assemble(re: RemoteEntry, reuse?: Map<string, Uint8Array>): Promise<Uint8Array> {
-    const parts: Array<Uint8Array | undefined> = re.c.map((id) => reuse?.get(id));
-    const missing: number[] = [];
-    parts.forEach((p, i) => {
-      if (!p) missing.push(i);
-    });
-    await pool(missing, this.conc, async (i) => {
-      parts[i] = await this.fetchChunk(re.c[i]);
-    });
-    const data = concat(parts as Uint8Array[]);
-    if (data.length !== re.s || (await sha256Hex(data)) !== re.h) throw new Error("File integrity check failed");
-    return data;
-  }
-
-  private async localChunks(path: string): Promise<Map<string, Uint8Array>> {
-    const data = await this.o.io.read(path);
-    const map = new Map<string, Uint8Array>();
-    for (const [s, e] of chunkRanges(data, this.chunkOpts)) {
-      const part = data.subarray(s, e);
-      map.set(await this.cipher.chunkId(part), part);
+  private async remoteHash(rf: RemoteFile): Promise<string> {
+    const key = `${rf.enc}|${rf.sig}`;
+    let h = this.hashCache.get(key);
+    if (!h) {
+      h = await sha256Hex(await this.download(rf));
+      this.hashCache.set(key, h);
     }
-    return map;
+    return h;
   }
 
-  // ───────────────────────── sync ─────────────────────────
-
-  async sync(): Promise<SyncStats> {
-    this.stats = emptyStats();
-    this.errors.clear();
-    this.phase("Connecting…");
-    await this.unlockRemote();
-    let result: PassResult = "retry";
-    let again = 0;
-    for (let i = 0; i < 6 && result !== "done"; i++) {
-      result = await this.pass();
-      if (result === "again" && ++again >= 2) result = "done";
-    }
-    if (result === "retry") throw new Error("The remote index kept changing during sync; try again.");
-    this.stats.errors = [...this.errors].map(([path, message]) => ({ path, message }));
-    this.phase(this.stats.errors.length ? `Finished with ${this.stats.errors.length} error(s)` : "Up to date");
-    return this.stats;
+  private nameTooLong(enc: string): boolean {
+    return enc.split("/").some((s) => te.encode(s).length > MAX_SEGMENT);
   }
 
-  private async pass(): Promise<PassResult> {
+  // ───────────────────────── analysis (read-only) ─────────────────────────
+
+  /**
+   * Shared by sync and dry run. Reads the server listing, scans/hashes local files and runs the
+   * 3-way compare. Changes nothing persistent; bookkeeping for the caller is returned in
+   * `adopt` / `resetBase`. May download files read-only to prove two copies are identical.
+   */
+  private async analyze() {
     const { io, state } = this.o;
-    this.phase("Reading remote index…");
-    const loaded = await this.loadIndex();
-    // Remote index vanished (new/empty folder): don't mass-delete local files, re-upload instead.
-    if (!loaded && Object.keys(state.files).length) {
-      this.log("remote index missing: resetting local base");
-      state.files = {};
-    }
-    const index: RemoteIndex = loaded?.index ?? { v: 1, rev: 0, files: {} };
-    for (const e of Object.values(index.files)) if (!e.d) for (const id of e.c) this.known.add(id);
+    await this.init();
+    this.phase("Listing files on the server…");
+    const remote = await this.listRemote();
+    // Empty server folder although we have history (wrong/new folder): re-upload, never delete locally.
+    const resetBase = remote.size === 0 && Object.keys(state.files).length > 0;
+    const base: Record<string, BaseEntry> = resetBase ? {} : state.files;
 
-    // 1. scan local files, hashing only those whose size/mtime changed since the base
     this.phase("Scanning local files…");
     const files = await io.list((p) => this.isExcluded(p));
     const local = new Map(files.map((f) => [f.path, f]));
     const lh = new Map<string, string>();
     const toHash: FileInfo[] = [];
     for (const f of files) {
-      const b = state.files[f.path];
+      const b = base[f.path];
       if (b && b.s === f.size && b.m === f.mtime) lh.set(f.path, b.h);
       else toHash.push(f);
     }
@@ -340,56 +295,125 @@ export class SyncEngine {
       lh.set(f.path, await sha256Hex(await io.read(f.path)));
     });
 
-    // 2. plan (3-way compare)
-    const pull: Array<{ p: string; reuse: boolean }> = [];
+    const pull: string[] = [];
     const push: string[] = [];
     const delLocal: string[] = [];
     const delRemote: string[] = [];
     const conflicts: string[] = [];
-    const paths = new Set([...local.keys(), ...Object.keys(index.files), ...Object.keys(state.files)]);
+    /** paths where both sides agree: just (re)record the base; null = forget it */
+    const adopt: Array<[string, BaseEntry | null]> = [];
+    let identical = 0;
+    /** exist on both sides with unknown relation: compare content before deciding */
+    const maybe: Array<{ p: string; L: string; f: FileInfo; rf: RemoteFile; same?: boolean }> = [];
+
+    const paths = new Set([...local.keys(), ...remote.keys(), ...Object.keys(base)]);
     for (const p of paths) {
       if (this.isExcluded(p)) continue;
       const L = lh.get(p) ?? null;
-      const re = index.files[p];
-      const R = re && !re.d ? re.h : null;
-      if (L === R) {
-        if (L === null) delete state.files[p];
-        else {
-          const f = local.get(p)!;
-          state.files[p] = { h: L, s: f.size, m: f.mtime };
-        }
+      const f = local.get(p);
+      const rf = remote.get(p);
+      const b = base[p];
+      if (!b) {
+        if (L && !rf) push.push(p);
+        else if (!L && rf) pull.push(p);
+        else if (L && rf) maybe.push({ p, L, f: f!, rf });
         continue;
       }
-      const hasBase = p in state.files;
-      if (!hasBase) {
-        if (L && !R) push.push(p);
-        else if (!L && R) pull.push({ p, reuse: false });
-        else conflicts.push(p);
-        continue;
-      }
-      const B = state.files[p].h;
-      const lc = L !== B;
-      const rc = R !== B;
-      if (lc && !rc) (L ? push : delRemote).push(p);
-      else if (!lc && rc) {
-        if (R) pull.push({ p, reuse: local.has(p) });
-        else delLocal.push(p);
-      } else if (L && R) conflicts.push(p);
-      else if (R) pull.push({ p, reuse: false }); // deleted locally, modified remotely -> restore
-      else push.push(p); // deleted remotely, modified locally -> keep local
+      const lc = L !== b.h;
+      const rc = (rf ? rf.sig : null) !== b.r;
+      if (!lc && !rc) {
+        adopt.push([p, { ...b, s: f!.size, m: f!.mtime }]);
+        identical++;
+      } else if (lc && !rc) (L ? push : delRemote).push(p);
+      else if (!lc && rc) (rf ? pull : delLocal).push(p);
+      else if (!L && !rf) adopt.push([p, null]); // deleted on both sides
+      else if (!L) pull.push(p); // deleted locally, modified remotely -> restore
+      else if (!rf) push.push(p); // deleted remotely, modified locally -> keep local
+      else maybe.push({ p, L, f: f!, rf });
     }
-    this.log(
-      `plan: push ${push.length}, pull ${pull.length}, delLocal ${delLocal.length}, delRemote ${delRemote.length}, conflicts ${conflicts.length}`
-    );
 
-    for (const { p } of pull) this.emit(p, "download", "pending");
+    if (maybe.length) {
+      this.phase(`Comparing ${maybe.length} file(s) with the server…`);
+      await pool(maybe, this.conc, async (m) => {
+        m.same = m.rf.size === m.f.size && (await this.remoteHash(m.rf)) === m.L;
+      });
+      for (const m of maybe) {
+        if (m.same) {
+          adopt.push([m.p, { h: m.L, s: m.f.size, m: m.f.mtime, r: m.rf.sig }]);
+          identical++;
+        } else conflicts.push(m.p);
+      }
+    }
+
+    const baseCount = Math.max(1, Object.keys(base).length);
+    const bigShare = (n: number) => n >= MASS_DELETE_MIN && n > MASS_DELETE_SHARE * baseCount;
+    const massDelete = bigShare(delLocal.length) || bigShare(delRemote.length);
+
+    this.log(`plan: push ${push.length}, pull ${pull.length}, delLocal ${delLocal.length}, delRemote ${delRemote.length}, conflicts ${conflicts.length}`);
+    return { remote, local, pull, push, delLocal, delRemote, conflicts, adopt, resetBase, identical, massDelete };
+  }
+
+  /**
+   * Dry run: shows what a sync would do right now without changing anything
+   * (no local writes, no uploads, no deletions, no state changes).
+   */
+  async dryRun(): Promise<DryRunResult> {
+    const a = await this.analyze();
+    const items: PlanItem[] = [];
+    const tooLong: string[] = [];
+    for (const p of a.pull) items.push({ path: p, action: "download", size: a.remote.get(p)!.size >= 0 ? a.remote.get(p)!.size : undefined });
+    for (const p of a.push) {
+      items.push({ path: p, action: "upload", size: a.local.get(p)!.size });
+      if (this.nameTooLong(await this.cipher.encName(p))) tooLong.push(p);
+    }
+    for (const p of a.delLocal) items.push({ path: p, action: "delete-local" });
+    for (const p of a.delRemote) items.push({ path: p, action: "delete-remote" });
+    for (const p of a.conflicts) {
+      const newer = (a.remote.get(p)!.modified ?? 0) > a.local.get(p)!.mtime ? "server" : "this device";
+      items.push({ path: p, action: "conflict", detail: `the ${newer} version keeps the name; the other is saved as a "(conflict …)" copy` });
+    }
+    this.phase(items.length ? `Dry run: ${items.length} change(s) pending` : "Dry run: nothing to do");
+    return { items, identical: a.identical, totalLocal: a.local.size, remoteWillBeReset: a.resetBase, massDelete: a.massDelete, tooLong };
+  }
+
+  // ───────────────────────── sync ─────────────────────────
+
+  async sync(): Promise<SyncStats> {
+    this.stats = emptyStats();
+    this.errors.clear();
+    this.phase("Connecting…");
+    for (let i = 0; i < 2; i++) if (!(await this.pass())) break; // a 2nd pass uploads conflict copies
+    this.stats.errors = [...this.errors].map(([path, message]) => ({ path, message }));
+    this.phase(this.stats.errors.length ? `Finished with ${this.stats.errors.length} error(s)` : "Up to date");
+    return this.stats;
+  }
+
+  /** @returns true if conflict copies were created and another pass should pick them up */
+  private async pass(): Promise<boolean> {
+    const { io, state } = this.o;
+    const a = await this.analyze();
+    const { remote, local, pull, push, delLocal, delRemote, conflicts } = a;
+    if (a.massDelete && !this.o.allowMassDelete)
+      throw new Error(
+        `Refusing to delete ${delLocal.length} local / ${delRemote.length} remote files at once — that is a large share of your vault. ` +
+          `Run "Check changes" to review. If it is intended, turn on "Allow deleting many files at once" in the plugin settings.`
+      );
+    if (a.resetBase) {
+      this.log("server folder is empty: resetting local base");
+      state.files = {};
+    }
+    for (const [p, b] of a.adopt) {
+      if (b) state.files[p] = b;
+      else delete state.files[p];
+    }
+
+    for (const p of pull) this.emit(p, "download", "pending");
     for (const p of push) this.emit(p, "upload", "pending");
     for (const p of delLocal) this.emit(p, "delete-local", "pending");
     for (const p of delRemote) this.emit(p, "delete-remote", "pending");
     for (const p of conflicts) this.emit(p, "conflict", "pending");
     this.phase(push.length + pull.length + delLocal.length + delRemote.length + conflicts.length ? "Transferring…" : "Nothing to transfer");
 
-    // 3. local-side actions
     await pool(delLocal, this.conc, (p) =>
       this.run(p, "delete-local", async () => {
         await io.remove(p);
@@ -398,28 +422,20 @@ export class SyncEngine {
       })
     );
 
-    const doPull = async (p: string, reuse: boolean) => {
-      const re = index.files[p];
-      const have = reuse ? await this.localChunks(p) : undefined;
-      const data = await this.assemble(re, have);
-      await io.write(p, data, re.m);
-      state.files[p] = { h: re.h, s: data.length, m: re.m };
-      this.stats.downloaded++;
-    };
-    await pool(pull, this.conc, ({ p, reuse }) => this.run(p, "download", () => doPull(p, reuse)));
+    await pool(pull, this.conc, (p) => this.run(p, "download", () => this.pullFile(p, remote.get(p)!)));
 
-    // conflicts: the newer mtime wins the path, the loser is preserved as a sibling copy
+    // conflicts: the newer side keeps the name, the other version is preserved as a sibling copy
     for (const p of conflicts) {
       await this.run(p, "conflict", async () => {
         const f = local.get(p)!;
-        const re = index.files[p];
+        const rf = remote.get(p)!;
         const copy = await this.conflictName(p);
-        if (re.m > f.mtime) {
+        if ((rf.modified ?? 0) > f.mtime) {
           await io.write(copy, await io.read(p), f.mtime);
-          await doPull(p, false);
+          await this.pullFile(p, rf);
         } else {
-          await io.write(copy, await this.assemble(re), re.m);
-          push.push(p);
+          await io.write(copy, await this.download(rf), rf.modified ?? Date.now());
+          await this.pushFile(p, f, rf);
         }
         this.stats.conflicts++;
         this.log(`conflict on ${p} -> ${copy}`);
@@ -427,53 +443,67 @@ export class SyncEngine {
       });
     }
 
-    // 4. push (upload new chunks first, commit index last)
-    const next: RemoteIndex = { v: 1, rev: index.rev + 1, files: { ...index.files } };
-    const baseUpdates = new Map<string, BaseEntry>();
-    const now = Date.now();
-    await pool(push, this.conc, async (p) => {
-     await this.run(p, "upload", async () => {
-      const f = local.get(p)!;
-      const data = await io.read(p);
-      const ids: string[] = [];
-      for (const [s, e] of chunkRanges(data, this.chunkOpts)) {
-        const part = data.subarray(s, e);
-        const id = await this.cipher.chunkId(part);
-        ids.push(id);
-        await this.uploadChunk(id, part);
-      }
-      const h = await sha256Hex(data);
-      next.files[p] = { h, s: data.length, m: f.mtime, c: ids, r: now };
-      baseUpdates.set(p, { h, s: data.length, m: f.mtime });
-      this.stats.uploaded++;
-     });
-    });
-    for (const p of delRemote) {
-      next.files[p] = { h: "", s: 0, m: 0, c: [], d: true, r: now };
-      this.stats.deletedRemote++;
-      this.emit(p, "delete-remote", "active");
-    }
-    for (const [p, e] of Object.entries(next.files)) if (e.d && now - e.r > TOMBSTONE_TTL) delete next.files[p];
+    await pool(push, this.conc, (p) => this.run(p, "upload", () => this.pushFile(p, local.get(p)!, remote.get(p))));
 
-    if (baseUpdates.size || delRemote.length) {
-      this.phase("Updating remote index…");
-      try {
-        await this.saveIndex(next, loaded);
-      } catch (e) {
-        if (e instanceof PreconditionFailed) {
-          await this.o.saveState();
-          return "retry";
-        }
-        throw e;
-      }
-      for (const [p, b] of baseUpdates) state.files[p] = b;
-      for (const p of delRemote) {
-        delete state.files[p];
-        this.emit(p, "delete-remote", "done");
-      }
-    }
+    await pool(delRemote, this.conc, (p) => this.run(p, "delete-remote", () => this.deleteRemote(p, remote.get(p)!)));
+
     await this.o.saveState();
-    return conflicts.length ? "again" : "done";
+    return conflicts.length > 0;
+  }
+
+  private async pullFile(p: string, rf: RemoteFile): Promise<void> {
+    const data = await this.download(rf);
+    const mtime = rf.modified ?? Date.now();
+    await this.o.io.write(p, data, mtime);
+    this.o.state.files[p] = { h: await sha256Hex(data), s: data.length, m: mtime, r: rf.sig };
+    this.stats.downloaded++;
+  }
+
+  /**
+   * Uploads one file. Overwrites are conditional (If-Match = the ETag we based our decision on) and
+   * new files use If-None-Match, so a concurrent change by another device is never overwritten silently.
+   */
+  private async pushFile(p: string, f: FileInfo, rf: RemoteFile | undefined): Promise<void> {
+    const data = await this.o.io.read(p);
+    const enc = await this.cipher.encName(p);
+    if (this.nameTooLong(enc))
+      throw new Error("File name is too long once encrypted (servers allow ~255 bytes per name segment). Shorten the name or exclude it.");
+    const blob = await this.cipher.encData(data);
+    const cond = rf ? (rf.etag ? { ifMatch: rf.etag } : {}) : { ifNoneMatch: true };
+    try {
+      await this.o.dav.put(enc, blob, cond);
+    } catch (e) {
+      await this.resolveSpurious412(e, enc, rf, () => this.o.dav.put(enc, blob));
+    }
+    this.stats.bytesUp += blob.length;
+    const st = await this.o.dav.stat(enc);
+    if (!st) throw new Error("Upload finished but the file is not visible on the server");
+    this.o.state.files[p] = { h: await sha256Hex(data), s: data.length, m: f.mtime, r: sigOf(st) };
+    this.stats.uploaded++;
+  }
+
+  private async deleteRemote(p: string, rf: RemoteFile): Promise<void> {
+    try {
+      await this.o.dav.delete(rf.enc, rf.etag ? { ifMatch: rf.etag } : {});
+    } catch (e) {
+      await this.resolveSpurious412(e, rf.enc, rf, () => this.o.dav.delete(rf.enc));
+    }
+    delete this.o.state.files[p];
+    this.stats.deletedRemote++;
+  }
+
+  /**
+   * A 412 means either another device changed the file meanwhile (real conflict: report it, the next
+   * sync reconciles it) or the server's validators don't round-trip. If the file's signature is still
+   * what we based our decision on, nobody touched it, so the unconditional retry is safe.
+   */
+  private async resolveSpurious412(e: unknown, enc: string, rf: RemoteFile | undefined, retry: () => Promise<unknown>) {
+    if (!(e instanceof PreconditionFailed)) throw e;
+    const cur = await this.o.dav.stat(enc);
+    if (rf && cur && sigOf(cur) === rf.sig) {
+      this.log(`server rejected If-Match for ${enc.slice(0, 8)}… although unchanged; retrying unconditionally`);
+      await retry();
+    } else throw new Error("Changed on the server while syncing; it will be reconciled on the next sync.");
   }
 
   private async conflictName(p: string): Promise<string> {
@@ -487,36 +517,5 @@ export class SyncEngine {
       const c = `${stem} (conflict ${dev} ${ts}${n ? " " + n : ""})${ext}`;
       if (!(await this.o.io.exists(c))) return c;
     }
-  }
-
-  // ───────────────────────── maintenance ─────────────────────────
-
-  /**
-   * Deletes remote chunks that no file in the index references.
-   * Only chunks older than `minAgeMs` are removed, so uploads in flight from other
-   * devices are not hit. Run it while other devices are idle.
-   */
-  async gc(minAgeMs = 24 * 3600 * 1000): Promise<{ deleted: number; kept: number }> {
-    await this.unlockRemote();
-    const loaded = await this.loadIndex();
-    if (!loaded) return { deleted: 0, kept: 0 };
-    const used = new Set<string>();
-    for (const e of Object.values(loaded.index.files)) if (!e.d) for (const id of e.c) used.add(id);
-    let deleted = 0;
-    let kept = 0;
-    const now = Date.now();
-    const dirs = (await this.o.dav.list("chunks")) ?? [];
-    for (const d of dirs) {
-      if (!d.isDir) continue;
-      for (const f of (await this.o.dav.list(`chunks/${d.name}`)) ?? []) {
-        if (f.isDir) continue;
-        if (!used.has(f.name) && f.modified !== undefined && now - f.modified > minAgeMs) {
-          await this.o.dav.delete(`chunks/${d.name}/${f.name}`);
-          this.known.delete(f.name);
-          deleted++;
-        } else kept++;
-      }
-    }
-    return { deleted, kept };
   }
 }

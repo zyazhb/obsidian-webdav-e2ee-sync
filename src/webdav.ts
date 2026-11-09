@@ -174,7 +174,7 @@ export class WebDAV {
     if (o.ifMatch) headers["If-Match"] = o.ifMatch;
     if (o.ifNoneMatch) headers["If-None-Match"] = "*";
     let r = await this.req("PUT", path, { headers, body: data });
-    if ([403, 404, 405, 409].includes(r.status) && path.includes("/")) {
+    if ([403, 404, 405, 409].includes(r.status)) {
       // parent collection probably missing (servers differ: 409 per RFC, but some answer 403/404/405)
       const parent = path.split("/").slice(0, -1).join("/");
       await this.ensureDir(parent);
@@ -185,25 +185,64 @@ export class WebDAV {
     return r.headers["etag"];
   }
 
-  async delete(path: string): Promise<void> {
-    const r = await this.req("DELETE", path);
+  /** Stat one file/collection via PROPFIND (the ETag here is the one If-Match compares against). */
+  async stat(path: string): Promise<DavEntry | null> {
+    const r = await this.req("PROPFIND", path, {
+      headers: { Depth: "0", "Content-Type": "application/xml; charset=utf-8" },
+      body: PROPFIND_BODY,
+    });
+    if (r.status === 404) return null;
+    if (r.status !== 207 && r.status !== 200) this.fail(r, `PROPFIND ${path}`);
+    const e = parseMultistatus(new TextDecoder().decode(r.body))[0];
+    if (!e) return null;
+    const { pathname: _p, ...rest } = e;
+    return rest;
+  }
+
+  async delete(path: string, o: { ifMatch?: string } = {}): Promise<void> {
+    const r = await this.req("DELETE", path, { headers: o.ifMatch ? { "If-Match": o.ifMatch } : undefined });
+    if (r.status === 412) throw new PreconditionFailed(`DELETE ${path}: precondition failed`);
     if (r.status !== 404 && (r.status < 200 || r.status >= 300)) this.fail(r, `DELETE ${path}`);
   }
 
-  /** mkdir -p (relative to the configured root, which is created as well). */
+  private dirJobs = new Map<string, Promise<void>>();
+
+  /** mkdir -p (relative to the configured root, which is created as well). Safe to call concurrently. */
   async ensureDir(path: string): Promise<void> {
     const all = this.segs(path);
     for (let i = 1; i <= all.length; i++) {
       const key = all.slice(0, i).join("/");
       if (this.dirs.has(key)) continue;
-      const r = await this.http({
-        url: this.base + "/" + all.slice(0, i).map(encodeURIComponent).join("/") + "/",
-        method: "MKCOL",
-        headers: this.auth ? { Authorization: this.auth } : {},
-      });
-      // 201 created; 405 already exists; 301 some servers redirect to the slash form
-      if (r.status !== 201 && r.status !== 405 && r.status !== 301 && r.status !== 200) this.fail(r, `MKCOL ${key}`);
+      // one MKCOL per directory at a time: concurrent uploads into a new folder share the same job
+      let job = this.dirJobs.get(key);
+      if (!job) {
+        job = this.makeDir(all.slice(0, i)).finally(() => this.dirJobs.delete(key));
+        this.dirJobs.set(key, job);
+      }
+      await job;
       this.dirs.add(key);
     }
+  }
+
+  private async makeDir(segs: string[]): Promise<void> {
+    const url = this.base + "/" + segs.map(encodeURIComponent).join("/") + "/";
+    const headers: Record<string, string> = this.auth ? { Authorization: this.auth } : {};
+    const r = await this.http({ url, method: "MKCOL", headers });
+    // 201 created; 405 already exists; 301 some servers redirect to the slash form
+    if ([201, 405, 301, 200].includes(r.status)) return;
+    // Servers disagree on what "already exists" looks like, and some answer 403 to a MKCOL that raced
+    // with another MKCOL of the same folder (seen on a real Apache-based service). Believe PROPFIND,
+    // and give a concurrent creator a moment to finish.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) await new Promise((res) => setTimeout(res, 200 * attempt));
+      const p = await this.http({
+        url,
+        method: "PROPFIND",
+        headers: { ...headers, Depth: "0", "Content-Type": "application/xml; charset=utf-8" },
+        body: PROPFIND_BODY,
+      });
+      if ((p.status === 207 || p.status === 200) && /collection/i.test(new TextDecoder().decode(p.body))) return;
+    }
+    this.fail(r, `MKCOL ${segs.join("/")}`);
   }
 }

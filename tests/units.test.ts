@@ -1,63 +1,98 @@
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { chunkRanges } from "../src/chunker";
-import { newMeta, unlock } from "../src/crypto";
-import { compileIgnore, toHex } from "../src/util";
+import { makeRcloneCipher } from "../src/cipher";
+import { compileIgnore } from "../src/util";
 import { parseMultistatus } from "../src/webdav";
 import { randomBytes } from "./helpers";
 
-describe("chunker", () => {
-  it("covers the input exactly and respects size bounds", () => {
-    const data = randomBytes(3_000_000, 7);
-    const ranges = chunkRanges(data);
-    expect(ranges[0][0]).toBe(0);
-    expect(ranges[ranges.length - 1][1]).toBe(data.length);
-    ranges.forEach(([s, e], i) => {
-      if (i > 0) expect(s).toBe(ranges[i - 1][1]);
-      expect(e - s).toBeLessThanOrEqual(256 * 1024);
-      if (i < ranges.length - 1) expect(e - s).toBeGreaterThanOrEqual(16 * 1024);
-    });
-    const avg = data.length / ranges.length;
-    expect(avg).toBeGreaterThan(32 * 1024);
-    expect(avg).toBeLessThan(140 * 1024);
-  });
+describe("rclone-crypt cipher wrapper", () => {
+  it("round-trips names and data, and rejects wrong keys / tampering", async () => {
+    const c = await makeRcloneCipher("pw", "salt");
+    const name = "Archived/2024WP/中国联通 网络安全 决赛.md";
+    const enc = await c.encName(name);
+    expect(enc).not.toMatch(/Archived|中国|md/);
+    expect(enc.split("/")).toHaveLength(3); // directory structure is kept, names are opaque
+    expect(await c.decName(enc)).toBe(name);
+    expect(await c.encName(name)).toBe(enc); // deterministic: same path -> same server path
 
-  it("is shift-resistant: inserting bytes only changes nearby chunks", () => {
-    const a = randomBytes(2_000_000, 3);
-    const b = new Uint8Array(a.length + 100);
-    b.set(a.subarray(0, 1_000_000), 0);
-    b.set(randomBytes(100, 99), 1_000_000);
-    b.set(a.subarray(1_000_000), 1_000_100);
-    const key = (d: Uint8Array) => chunkRanges(d).map(([s, e]) => toHex(d.subarray(s, e).slice(0, 32)) + (e - s));
-    const ka = new Set(key(a));
-    const kb = key(b);
-    const reused = kb.filter((k) => ka.has(k)).length;
-    expect(reused).toBeGreaterThanOrEqual(kb.length - 3);
-  });
-
-  it("handles empty and tiny inputs", () => {
-    expect(chunkRanges(new Uint8Array(0))).toEqual([]);
-    expect(chunkRanges(new Uint8Array(10))).toEqual([[0, 10]]);
-  });
-});
-
-describe("crypto", () => {
-  it("round-trips, binds AAD, rejects tampering and wrong passwords", async () => {
-    const { meta, cipher } = await newMeta("pw-1");
-    const msg = new TextEncoder().encode("hello world");
-    const blob = await cipher.encrypt(msg, "aad");
-    expect(new TextDecoder().decode(await cipher.decrypt(blob, "aad"))).toBe("hello world");
-    await expect(cipher.decrypt(blob, "other-aad")).rejects.toThrow();
+    const data = randomBytes(150_000, 9); // spans several 64 KiB blocks
+    const blob = await c.encData(data);
+    expect(c.plainSize(blob.length)).toBe(data.length);
+    expect(await c.decData(blob)).toEqual(data);
     const bad = blob.slice();
     bad[bad.length - 1] ^= 1;
-    await expect(cipher.decrypt(bad, "aad")).rejects.toThrow();
-    // same plaintext twice -> different ciphertext (random IV) but the same chunk id
-    expect(toHex(await cipher.encrypt(msg, "aad"))).not.toBe(toHex(blob));
-    expect(await cipher.chunkId(msg)).toBe(await cipher.chunkId(msg));
+    await expect(c.decData(bad)).rejects.toThrow();
 
-    const again = await unlock(meta, "pw-1");
-    expect(await again.chunkId(msg)).toBe(await cipher.chunkId(msg));
-    await expect(unlock(meta, "nope")).rejects.toThrow(/wrong/i);
+    const other = await makeRcloneCipher("pw", "other-salt");
+    await expect(other.decName(enc)).rejects.toThrow();
+    await expect(other.decData(blob)).rejects.toThrow();
   }, 30_000);
+});
+
+// Interoperability with the real rclone binary (skipped where rclone isn't installed).
+const hasRclone = (() => {
+  try {
+    return spawnSync("rclone", ["version"]).status === 0;
+  } catch {
+    return false;
+  }
+})();
+const rclone = (...args: string[]) => {
+  const r = spawnSync("rclone", args, { maxBuffer: 64 * 1024 * 1024 });
+  if (r.status !== 0) throw new Error(`rclone ${args[0]} failed: ${r.stderr}`);
+  return r.stdout as Buffer;
+};
+const walk = (d: string, rel = ""): string[] =>
+  readdirSync(d).flatMap((n) => (statSync(join(d, n)).isDirectory() ? walk(join(d, n), rel ? `${rel}/${n}` : n) : [rel ? `${rel}/${n}` : n]));
+
+describe.skipIf(!hasRclone)("interop with stock rclone crypt", () => {
+  for (const salt of ["salt", ""]) {
+    it(`both directions (${salt ? "custom salt" : "rclone default salt"})`, async () => {
+      const tmp = mkdtempSync(join(tmpdir(), "obsync-rclone-"));
+      const enc = join(tmp, "enc");
+      mkdirSync(enc);
+      const remote =
+        `:crypt,remote=${enc},password=${rclone("obscure", "pw").toString().trim()},` +
+        (salt ? `password2=${rclone("obscure", salt).toString().trim()},` : "") +
+        `filename_encryption=standard,directory_name_encryption=true,filename_encoding=base32:`;
+      const files: Record<string, Uint8Array> = {
+        "a.md": new TextEncoder().encode("hello"),
+        "Archived/2024WP/中国联通 决赛.md": new TextEncoder().encode("中文 ✓"),
+        "empty.md": new Uint8Array(0),
+        "img/big.bin": randomBytes(200_000, 3),
+      };
+      const c = await makeRcloneCipher("pw", salt);
+
+      // ours -> rclone reads it
+      for (const [p, d] of Object.entries(files)) {
+        const ep = join(enc, await c.encName(p));
+        mkdirSync(dirname(ep), { recursive: true });
+        writeFileSync(ep, await c.encData(d));
+      }
+      for (const [p, d] of Object.entries(files)) expect(new Uint8Array(rclone("cat", remote + p))).toEqual(d);
+      expect(rclone("lsf", "-R", remote).toString()).toContain("big.bin");
+
+      // rclone writes -> we read it
+      const plain = join(tmp, "plain");
+      mkdirSync(join(plain, "sub"), { recursive: true });
+      writeFileSync(join(plain, "sub", "汉字 name.md"), "一二三");
+      writeFileSync(join(plain, "r.bin"), randomBytes(130_000, 4));
+      rclone("copy", plain, remote);
+      const seen: string[] = [];
+      for (const encRel of walk(enc)) {
+        const name = await c.decName(encRel);
+        if (name in files) continue;
+        seen.push(name);
+        expect(new Uint8Array(await c.decData(new Uint8Array(readFileSync(join(enc, encRel)))))).toEqual(
+          new Uint8Array(readFileSync(join(plain, name)))
+        );
+      }
+      expect(seen.sort()).toEqual(["r.bin", "sub/汉字 name.md"]);
+    }, 60_000);
+  }
 });
 
 describe("webdav + ignore helpers", () => {

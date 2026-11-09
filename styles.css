@@ -20,3 +20,33 @@
 .wds-ignored { opacity: 0.5; }
 @keyframes wds-spin { to { transform: rotate(360deg); } }
 .wds-statusbar { cursor: pointer; }
+
+/* ── pairing modals ── */
+.wds-modal .wds-warn { color: var(--text-warning); font-size: var(--font-ui-small); }
+.wds-qr { display: flex; justify-content: center; margin: 12px 0 4px; }
+.wds-qr canvas {
+  width: min(78vw, 340px);
+  height: auto;
+  aspect-ratio: 1;
+  image-rendering: pixelated;
+  background: #fff; /* never themed: scanners need dark-on-light */
+  border-radius: 6px;
+}
+.wds-modal .wds-sub { text-align: center; margin-bottom: 8px; }
+.wds-video { width: 100%; max-height: 55vh; border-radius: 6px; background: #000; object-fit: cover; }
+
+/* ── phones and tablets ── */
+.is-mobile .wds-view { padding: 8px 10px; }
+.is-mobile .wds-toolbar { flex-wrap: wrap; }
+.is-mobile .wds-toolbar input,
+.is-mobile .wds-toolbar select { min-height: 40px; font-size: 16px; } /* 16px stops iOS zooming on focus */
+.is-mobile .wds-top button { min-height: 40px; padding: 0 16px; }
+.is-mobile .wds-row { padding: 10px 0; }
+.is-mobile .wds-icon { width: 1.6em; font-size: 1.1em; }
+.is-mobile .wds-modal button { min-height: 40px; }
+
+/* ── dry run ── */
+.wds-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+.wds-top { flex-wrap: wrap; }
+.wds-previewbox { font-size: var(--font-ui-small); padding: 6px 8px; border-radius: 6px; background: var(--background-secondary); border-left: 3px solid var(--interactive-accent); }
+.wds-row.wds-preview .wds-icon { color: var(--interactive-accent); }

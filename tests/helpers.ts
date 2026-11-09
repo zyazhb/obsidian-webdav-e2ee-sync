@@ -15,6 +15,8 @@ export class FakeDavServer {
   gzipEtagOnGet = false;
   /** emulate a server whose If-Match never matches */
   ifMatchAlwaysFails = false;
+  /** status for MKCOL on an existing collection: 405 per RFC, but some servers answer 403 */
+  mkcolExistsStatus = 405;
 
   http: HttpFn = async (r: HttpRequest): Promise<HttpResponse> => {
     const u = new URL(r.url);
@@ -47,7 +49,7 @@ export class FakeDavServer {
         return res(207, xml + "</d:multistatus>");
       }
       case "MKCOL":
-        if (this.dirs.has(path) || this.files.has(path)) return res(405);
+        if (this.dirs.has(path) || this.files.has(path)) return res(this.mkcolExistsStatus);
         if (!this.dirs.has(parent)) return res(409);
         this.dirs.add(path);
         return res(201);
@@ -64,8 +66,11 @@ export class FakeDavServer {
         this.files.set(path, { data: new Uint8Array(r.body as Uint8Array), etag, modified: Date.now() });
         return res(cur ? 204 : 201, "", { etag: `"${etag}"` });
       }
-      case "DELETE":
+      case "DELETE": {
+        const cur = this.files.get(path);
+        if (cur && r.headers?.["If-Match"] && (this.ifMatchAlwaysFails || `"${cur.etag}"` !== r.headers["If-Match"])) return res(412);
         return this.files.delete(path) ? res(204) : res(404);
+      }
     }
     return res(405);
   };

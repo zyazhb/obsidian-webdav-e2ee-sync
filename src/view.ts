@@ -2,7 +2,7 @@ import { ItemView, WorkspaceLeaf } from "obsidian";
 
 export const VIEW_TYPE = "webdav-sync-status";
 
-export type RowState = "active" | "pending" | "error" | "done" | "synced" | "unsynced" | "ignored";
+export type RowState = "active" | "pending" | "error" | "done" | "synced" | "unsynced" | "ignored" | "preview";
 export interface StatusRow {
   path: string;
   state: RowState;
@@ -15,11 +15,14 @@ export interface StatusSummary {
   done: number;
   total: number;
   lastSync: string;
+  /** one-line result of the last dry run, if any */
+  preview?: string;
 }
 export interface StatusSource {
   getRows(): StatusRow[];
   getSummary(): StatusSummary;
   syncNow(): void;
+  previewNow(): void;
   openFile(path: string): void;
 }
 
@@ -31,8 +34,9 @@ const ICON: Record<RowState, string> = {
   synced: "✓",
   unsynced: "●",
   ignored: "–",
+  preview: "◇",
 };
-const ORDER: Record<RowState, number> = { active: 0, error: 1, pending: 2, unsynced: 3, done: 4, synced: 5, ignored: 6 };
+const ORDER: Record<RowState, number> = { active: 0, error: 1, pending: 2, preview: 3, unsynced: 4, done: 5, synced: 6, ignored: 7 };
 const MAX_ROWS = 500;
 
 type Filter = "attention" | "all" | "errors";
@@ -91,7 +95,12 @@ export class SyncStatusView extends ItemView {
     this.headEl.empty();
     const top = this.headEl.createDiv({ cls: "wds-top" });
     top.createSpan({ cls: "wds-phase", text: s.syncing ? s.phase : s.phase || "Idle" });
-    const btn = top.createEl("button", { text: s.syncing ? "Syncing…" : "Sync now", cls: "mod-cta" });
+    const btns = top.createDiv({ cls: "wds-btns" });
+    const check = btns.createEl("button", { text: "Check changes" });
+    check.setAttribute("aria-label", "Dry run: compare with the server and list what a sync would do, without changing anything");
+    check.disabled = s.syncing;
+    check.addEventListener("click", () => this.src.previewNow());
+    const btn = btns.createEl("button", { text: s.syncing ? "Syncing…" : "Sync now", cls: "mod-cta" });
     btn.disabled = s.syncing;
     btn.addEventListener("click", () => this.src.syncNow());
     if (s.total > 0) {
@@ -100,6 +109,7 @@ export class SyncStatusView extends ItemView {
       prog.value = s.done;
       this.headEl.createDiv({ cls: "wds-sub", text: `${s.done} / ${s.total} files` });
     }
+    if (s.preview) this.headEl.createDiv({ cls: "wds-previewbox", text: s.preview });
     if (s.lastSync) this.headEl.createDiv({ cls: "wds-sub", text: `Last sync: ${s.lastSync}` });
     this.renderList();
   }
@@ -107,7 +117,7 @@ export class SyncStatusView extends ItemView {
   private renderList() {
     if (!this.listEl) return;
     const all = this.src.getRows();
-    const counts: Record<RowState, number> = { active: 0, pending: 0, error: 0, done: 0, synced: 0, unsynced: 0, ignored: 0 };
+    const counts: Record<RowState, number> = { active: 0, pending: 0, error: 0, done: 0, synced: 0, unsynced: 0, ignored: 0, preview: 0 };
     for (const r of all) counts[r.state]++;
 
     let rows = all.filter((r) => (this.query ? r.path.toLowerCase().includes(this.query) : true));
@@ -120,7 +130,8 @@ export class SyncStatusView extends ItemView {
       cls: "wds-counts",
       text:
         `${counts.synced + counts.done} synced · ${counts.unsynced + counts.pending} waiting · ` +
-        `${counts.active} in progress · ${counts.error} errors · ${counts.ignored} ignored`,
+        `${counts.active} in progress · ${counts.error} errors · ${counts.ignored} ignored` +
+        (counts.preview ? ` · ${counts.preview} would change` : ""),
     });
     if (!rows.length) this.listEl.createDiv({ cls: "wds-empty", text: "Nothing to show." });
     for (const r of rows.slice(0, MAX_ROWS)) {
