@@ -35,11 +35,17 @@ jobs:
       - run: bun test
       - run: bun run build
 
+      - name: Package zip (folder ready to drop into .obsidian/plugins)
+        run: |
+          mkdir -p "dist/webdav-e2ee-sync"
+          cp main.js manifest.json styles.css "dist/webdav-e2ee-sync/"
+          (cd dist && zip -r "../webdav-e2ee-sync-$GITHUB_REF_NAME.zip" "webdav-e2ee-sync")
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PRE=""
           case "$GITHUB_REF_NAME" in *-*) PRE="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" main.js manifest.json styles.css \
+          gh release create "$GITHUB_REF_NAME" main.js manifest.json styles.css "webdav-e2ee-sync-$GITHUB_REF_NAME.zip" \
             --title "$GITHUB_REF_NAME" --generate-notes $PRE
